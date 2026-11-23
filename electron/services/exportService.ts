@@ -1,4 +1,5 @@
-﻿import * as fs from 'fs'
+import { callInfo, callText, mediaFileName, writeExportTimeline, type TimelineMessage } from './exportTimeline'
+import * as fs from 'fs'
 import * as path from 'path'
 import * as http from 'http'
 import * as https from 'https'
@@ -1119,9 +1120,9 @@ class ExportService {
 
   private getTargetMediaLocalTypes(options: ExportOptions): Set<number> {
     const mediaContentType = this.getMediaContentType(options)
-    if (mediaContentType === 'voice') return new Set([34])
+    if (mediaContentType === 'voice') return new Set([34, 50])
     if (mediaContentType === 'image') return new Set([3])
-    if (mediaContentType === 'video') return new Set([43])
+    if (mediaContentType === 'video') return new Set([43, 50])
     if (mediaContentType === 'emoji') return new Set([47])
     if (mediaContentType === 'file') return new Set(FILE_APP_LOCAL_TYPES)
 
@@ -1418,6 +1419,7 @@ class ExportService {
   ): boolean {
     const allowFileProbe = options?.allowFileProbe === true
     if (!targetMediaTypes || (!targetMediaTypes.has(localType) && !allowFileProbe)) return false
+    if (localType === 50) return true
     // 语音导出仅需要 localId 读取音频数据，不依赖 XML 内容
     if (localType === 34) return false
     // 图片/视频/表情/文件可能需要从 XML 提取 md5/datName/附件信息
@@ -3117,55 +3119,17 @@ class ExportService {
    * room_type: 0 = 语音通话, 1 = 视频通话
    */
   private parseVoipMessage(content: string): string {
-    try {
-      if (!content) return '[通话]'
+    return callText(content)
+  }
 
-      // 提取 msg 内容（中文通话状态）
-      const msgMatch = /<msg><!\[CDATA\[(.*?)\]\]><\/msg>/i.exec(content)
-      const msg = msgMatch?.[1]?.trim() || ''
-
-      // 提取 room_type（0=视频，1=语音）
-      const roomTypeMatch = /<room_type>(\d+)<\/room_type>/i.exec(content)
-      const roomType = roomTypeMatch ? parseInt(roomTypeMatch[1], 10) : -1
-
-      // 构建通话类型标签
-      let callType: string
-      if (roomType === 0) {
-        callType = '视频通话'
-      } else if (roomType === 1) {
-        callType = '语音通话'
-      } else {
-        callType = '通话'
-      }
-
-      // 解析通话状态
-      if (msg.includes('通话时长')) {
-        const durationMatch = /通话时长\s*(\d{1,2}:\d{2}(?::\d{2})?)/i.exec(msg)
-        const duration = durationMatch?.[1] || ''
-        if (duration) {
-          return `[${callType}] ${duration}`
-        }
-        return `[${callType}] 已接听`
-      } else if (msg.includes('对方无应答')) {
-        return `[${callType}] 对方无应答`
-      } else if (msg.includes('已取消')) {
-        return `[${callType}] 已取消`
-      } else if (msg.includes('已在其它设备接听') || msg.includes('已在其他设备接听')) {
-        return `[${callType}] 已在其他设备接听`
-      } else if (msg.includes('对方已拒绝') || msg.includes('已拒绝')) {
-        return `[${callType}] 对方已拒绝`
-      } else if (msg.includes('忙线未接听') || msg.includes('忙线')) {
-        return `[${callType}] 忙线未接听`
-      } else if (msg.includes('未接听')) {
-        return `[${callType}] 未接听`
-      } else if (msg) {
-        return `[${callType}] ${msg}`
-      }
-
-      return `[${callType}]`
-    } catch (e) {
-      return '[通话]'
-    }
+  private writeTimeline(sessionId: string, outputPath: string, rows: TimelineMessage[],
+    mediaCache: Map<string, MediaExportItem | null>, control?: ExportTaskControl): Promise<void> {
+    return writeExportTimeline({
+      sessionId, outputPath, rows,
+      mediaFor: row => mediaCache.get(this.getMediaCacheKey(row)),
+      checkCancelled: () => this.throwIfStopRequested(control),
+      beforePublish: destination => this.recordCreatedFileBeforeWrite(destination, control)
+    })
   }
 
   /**
@@ -4210,6 +4174,7 @@ class ExportService {
     if (options.exportFiles && this.isFileAppMessage(msg)) {
       return this.exportFileAttachment(
         msg,
+        sessionId,
         mediaRootDir,
         mediaRelativePrefix,
         options.maxFileSizeMb,
@@ -4343,7 +4308,7 @@ class ExportService {
       }
 
       // 为每条消息生成稳定且唯一的文件名前缀，避免跨日期/消息发生同名覆盖
-      const messageId = String(msg.localId || Date.now())
+      const messageId = String(msg.localId || 'image')
       const imageKey = (imageMd5 || imageDatName || 'image').replace(/[^a-zA-Z0-9_-]/g, '')
 
       // 从 data URL 或 file URL 获取实际路径
@@ -4351,7 +4316,7 @@ class ExportService {
         // 是 data URL，需要保存为文件
         const base64Data = sourcePath.split(',')[1]
         const ext = this.getExtFromDataUrl(sourcePath)
-        const fileName = `${messageId}_${imageKey}${ext}`
+        const fileName = mediaFileName(sessionId, msg, `${messageId}_${imageKey}${ext}`)
         const destPath = path.join(imagesDir, fileName)
 
         const buffer = Buffer.from(base64Data, 'base64')
@@ -4373,7 +4338,7 @@ class ExportService {
 
       // 复制文件
       const ext = path.extname(sourcePath) || '.jpg'
-      const fileName = `${messageId}_${imageKey}${ext}`
+      const fileName = mediaFileName(sessionId, msg, `${messageId}_${imageKey}${ext}`)
       const destPath = path.join(imagesDir, fileName)
       const copied = await this.copyMediaWithCacheAndDedup('image', sourcePath, destPath, control)
       if (!copied.success) {
@@ -4505,7 +4470,7 @@ class ExportService {
         .replace(/[^a-zA-Z0-9_-]/g, '_')
         .slice(0, 48) || 'session'
       const stableKey = this.getStableMessageKey(msg).replace(/:/g, '_')
-      const fileName = `voice_${safeSession}_${stableKey || msgId}.wav`
+      const fileName = mediaFileName(sessionId, msg, `voice_${safeSession}_${stableKey || msgId}.wav`)
       const destPath = path.join(voicesDir, fileName)
 
       // 如果已存在则跳过
@@ -4586,7 +4551,7 @@ class ExportService {
       // 确定目标文件名
       const ext = path.extname(localPath) || '.gif'
       const key = msg.emojiMd5 || String(msg.localId)
-      const fileName = `${key}${ext}`
+      const fileName = mediaFileName(sessionId, msg, `${key}${ext}`)
       const destPath = path.join(emojisDir, fileName)
       const copied = await this.copyMediaWithCacheAndDedup('emoji', localPath, destPath, control)
       if (!copied.success) return null
@@ -4637,7 +4602,7 @@ class ExportService {
       await this.ensureExportDir(videosDir, control, dirCache)
 
       const sourcePath = videoInfo.videoUrl
-      const fileName = path.basename(sourcePath)
+      const fileName = mediaFileName(sessionId, msg, path.basename(sourcePath))
       const destPath = path.join(videosDir, fileName)
 
       const copied = await this.copyMediaWithCacheAndDedup('video', sourcePath, destPath, control)
@@ -5161,6 +5126,7 @@ class ExportService {
 
   private async exportFileAttachment(
     msg: any,
+    sessionId: string,
     mediaRootDir: string,
     mediaRelativePrefix: string,
     maxFileSizeMb?: number,
@@ -5214,8 +5180,7 @@ class ExportService {
       }
 
       const safeBaseName = path.basename(fileNameRaw).replace(/[\\/:*?"<>|]/g, '_') || 'file'
-      const messageId = String(msg?.localId || Date.now())
-      const destFileName = `${messageId}_${safeBaseName}`
+      const destFileName = mediaFileName(sessionId, msg, safeBaseName)
       const destPath = path.join(fileDir, destFileName)
       const existedBeforeCopy = await this.pathExists(destPath)
       const copied = await this.copyFileOptimized(selected.sourcePath, destPath)
@@ -5553,6 +5518,10 @@ class ExportService {
           const content = shouldDecodeContent
             ? this.decodeMessageContent(row.message_content, row.compress_content)
             : ''
+          if (localType === 50 && mediaTypeFilter?.has(50)) {
+            const requested = mediaTypeFilter.has(34) ? 'voice' : 'video'
+            if (callInfo(content).kind !== requested) continue
+          }
           const senderUsername = row.sender_username || ''
           const isSendRaw = row.computed_is_send ?? row.is_send ?? '0'
           const isSend = parseInt(isSendRaw, 10) === 1
@@ -6904,6 +6873,7 @@ class ExportService {
         await fs.promises.writeFile(outputPath, JSON.stringify(chatLabExport, null, 2), 'utf-8')
       }
 
+      await this.writeTimeline(sessionId, outputPath, collected.rows, mediaCache, control)
       onProgress?.({
         current: 100,
         total: 100,
@@ -7642,6 +7612,7 @@ class ExportService {
         await fs.promises.writeFile(outputPath, JSON.stringify(detailedExport, null, 2), 'utf-8')
       }
 
+      await this.writeTimeline(sessionId, outputPath, collected.rows, mediaCache, control)
       onProgress?.({
         current: 100,
         total: 100,
@@ -8205,6 +8176,7 @@ class ExportService {
       await this.recordCreatedFileBeforeWrite(outputPath, control)
       await workbook.xlsx.writeFile(outputPath)
 
+      await this.writeTimeline(sessionId, outputPath, collected.rows, mediaCache, control)
       onProgress?.({
         current: 100,
         total: 100,
@@ -8489,6 +8461,7 @@ class ExportService {
       worksheet.commit()
       await workbook.commit()
 
+      await this.writeTimeline(sessionId, outputPath, sortedMessages, mediaCache, control)
       onProgress?.({
         current: 100,
         total: 100,
@@ -8930,6 +8903,7 @@ class ExportService {
         stream.end(() => resolve())
       })
 
+      await this.writeTimeline(sessionId, outputPath, collected.rows, mediaCache, control)
       onProgress?.({
         current: 100,
         total: 100,
@@ -9297,6 +9271,7 @@ class ExportService {
         stream.end(() => resolve())
       })
 
+      await this.writeTimeline(sessionId, outputPath, collected.rows, mediaCache, control)
       onProgress?.({
         current: 100,
         total: 100,
@@ -9968,28 +9943,22 @@ class ExportService {
   </body>
 </html>`);
 
-      return new Promise((resolve, reject) => {
-        stream.on('error', (err) => {
-          // 确保在流错误时销毁流，释放文件句柄
-          stream.destroy()
-          reject(err)
-        })
-        
-        stream.end(() => {
-          onProgress?.({
-            current: 100,
-            total: 100,
-            currentSession: sessionInfo.displayName,
-            phase: 'complete',
-            estimatedTotalMessages: totalMessages,
-            collectedMessages: totalMessages,
-            exportedMessages: totalMessages,
-            writtenFiles: 1
-          })
-          resolve({ success: true })
-        })
-        stream.on('error', reject)
+      await new Promise<void>((resolve, reject) => {
+        stream.once('error', reject)
+        stream.end(resolve)
       })
+      await this.writeTimeline(sessionId, outputPath, collected.rows, mediaCache, control)
+      onProgress?.({
+        current: 100,
+        total: 100,
+        currentSession: sessionInfo.displayName,
+        phase: 'complete',
+        estimatedTotalMessages: totalMessages,
+        collectedMessages: totalMessages,
+        exportedMessages: totalMessages,
+        writtenFiles: 1
+      })
+      return { success: true }
 
     } catch (e) {
       if (this.isStopError(e)) {
@@ -10527,7 +10496,8 @@ class ExportService {
             messageCountHint >= 0 &&
             typeof latestTimestampHint === 'number' &&
             latestTimestampHint > 0 &&
-            await this.pathExists(preferredOutputPath)
+            await this.pathExists(preferredOutputPath) &&
+            await this.pathExists(preferredOutputPath + '.timeline.jsonl')
           if (canTrySkipUnchanged) {
             const latestRecord = exportRecordService.getLatestRecord(sessionId, effectiveOptions.format)
             const hasNoDataChange = Boolean(
